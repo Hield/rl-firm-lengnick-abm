@@ -1,0 +1,23 @@
+[tool.poetry]
+name = "rl-firm-lengnick-abm"
+version = "0.1.0"
+description = ""
+authors = ["Hieu Le <hieult1409@gmail.com>"]
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = ">=3.11,<3.14"
+jupyter = "^1.1.1"
+pandas = "^2.2.3"
+pydantic = "^2.11.1"
+seaborn = "^0.13.2"
+mesa = { extras = ["rec"], version = "^3.2.0" }
+gymnasium = { extras = ["box2d"], version = "^1.1.1" }
+swig = "^4.3.1"
+stable-baselines3 = { extras = ["extra"], version = "^2.6.0" }
+sb3-contrib = "^2.7.0"
+
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
