@@ -217,5 +217,10 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 
-# Pickle files
+# Mac files
+.DS_Store
+
+# Artifact files
 snapshots/
+runs/
+results/
