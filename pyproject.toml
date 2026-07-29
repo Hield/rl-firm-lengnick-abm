@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "rl-firm-lengnick-abm"
-version = "0.1.0"
+version = "1.0.0"
 description = ""
 authors = ["Hieu Le <hieult1409@gmail.com>"]
 readme = "README.md"
