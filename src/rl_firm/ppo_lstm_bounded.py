@@ -1,0 +1,440 @@
+import time
+from dataclasses import dataclass
+
+import gymnasium as gym
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.distributions.categorical import Categorical
+from torch.distributions.normal import Normal
+from torch.utils.tensorboard import SummaryWriter
+
+from .env import BaselineABMEnv, make_custom_unbounded_env
+from .util import RunningMeanStd
+
+@dataclass
+class HyperParameters:
+    total_timesteps: int = 1000000 # Total timesteps of the run
+    learning_rate: float = 0.0003  # The learning rate of the optimizer
+    num_envs: int = 8              # The number of parallel ABM environments
+    num_steps: int = 1024          # The number of the steps to run for each envivonrment per policy rollout
+    anneal_lr: bool = False        # Toggle learning rate annealing for policy and value networks
+    gamma: float = 0.999           # The discount factor gamma
+    gae: bool = True               # Toogle using general advantage estimation (GAE)
+    gae_lambda: float = 0.95       # The lambda for the GAE
+    num_minibatches: int = 4       # The number of mini-batches per batch
+    update_epochs: int = 10        # The number of epochs when optimizing
+    norm_adv: bool = True          # Toggle advantages normalization
+    clip_coef: float = 0.2         # The surrogate clipping coefficient
+    clip_vloss: bool = False       # Toggle whether or not to use a clipped loss for the value function
+    ent_coef: float = 0.0          # The coefficient of the entropy
+    vf_coef: float = 0.5           # The coefficient of the value function
+    max_grad_norm: float = 0.5     # The maximum norm for the gradient clipping
+    target_kl: float = None        # The target KL divergence threshold
+    # Environment reward hyperparameters
+    survival_bonus: float = None   # How much to reward firm for just staying afloat
+
+    @property
+    def batch_size(self) -> int:
+        return int(self.num_envs * self.num_steps)
+
+    @property
+    def minibatch_size(self) -> int:
+        return int(self.batch_size // self.num_minibatches)
+
+    @property
+    def num_iterations(self) -> int:
+        return int(self.total_timesteps // self.batch_size)
+
+
+def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
+    torch.nn.init.orthogonal_(layer.weight, std)
+    torch.nn.init.constant_(layer.bias, bias_const)
+    return layer
+
+
+class RecurrentPPOAgent(nn.Module):
+    def __init__(self, envs=None, obs_dim=None, act_limit=None):
+        super().__init__()
+
+        if obs_dim is None:
+            obs_dim = int(np.array(envs.single_observation_space.shape).prod())
+
+        # Running mean std for observation normalization
+        self.obs_rms = RunningMeanStd(obs_dim)
+
+        if act_limit is None:
+            # Default continous action bounds according to the ABM paper
+            act_limit = [0.02, 0.019]
+
+        self.register_buffer("act_low",  torch.tensor([-act_limit[0], -act_limit[1]], dtype=torch.float32))
+        self.register_buffer("act_high", torch.tensor([ act_limit[0],  act_limit[1]], dtype=torch.float32))
+        
+        # Shared feature network
+        self.network = nn.Sequential(
+            layer_init(nn.Linear(obs_dim, 128)),
+            nn.Tanh(),
+            layer_init(nn.Linear(128, 128)),
+            nn.Tanh(),
+        )
+
+        self.lstm = nn.LSTM(128, 128)
+        for name, param in self.lstm.named_parameters():
+            if 'bias' in name:
+                nn.init.constant_(param, 0)
+            elif 'weight' in name:
+                nn.init.orthogonal_(param, 1.0)
+
+        self.critic = layer_init(nn.Linear(128, 1), std=1.0)
+        self.cat_head = layer_init(nn.Linear(128, 3), std=0.01)
+        self.cont_mean = layer_init(nn.Linear(128, 2), std=0.01)
+        self.cont_logstd = nn.Parameter(torch.zeros(1, 2))
+
+    @staticmethod
+    def _tanh_correction(u: torch.Tensor) -> torch.Tensor:
+        # 2*(log(2) - u - softplus(-2u)) summed outside
+        return 2 * (np.log(2) - u - F.softplus(-2 * u))
+
+    def _squash_affine(self, y: torch.Tensor) -> torch.Tensor:
+        # y in (-1,1) -> [low, high]
+        return self.act_low + 0.5 * (y + 1.0) * (self.act_high - self.act_low)
+
+    def _unsquash_affine(self, a: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+        # [low, high] -> (-1,1) -> u = atanh(y)
+        a = torch.clamp(a, self.act_low + eps, self.act_high - eps)
+        y = 2.0 * (a - self.act_low) / (self.act_high - self.act_low) - 1.0
+        y = torch.clamp(y, -1.0 + eps, 1.0 - eps)
+        # atanh(y) = 0.5 * log((1+y)/(1-y))
+        return 0.5 * torch.log((1 + y) / (1 - y))
+
+    def get_states(self, x, lstm_state, done, update_obs_rms=False):
+        # Update and normalize the observation here
+        if update_obs_rms:
+            with torch.no_grad():
+                self.obs_rms.update(x)
+
+        x = self.obs_rms.normalize(x)
+        hidden = self.network(x)
+
+        # LSTM logic
+        batch_size = lstm_state[0].shape[1]
+        hidden = hidden.reshape((-1, batch_size, self.lstm.input_size))
+        done = done.reshape((-1, batch_size))
+        new_hidden = []
+        for h, d in zip(hidden, done):
+            h, lstm_state = self.lstm(h.unsqueeze(0), (
+                (1.0 - d).view(1, -1, 1) * lstm_state[0],
+                (1.0 - d).view(1, -1, 1) * lstm_state[1],
+            ))
+            new_hidden += [h]
+        new_hidden = torch.flatten(torch.cat(new_hidden), 0, 1)
+        return new_hidden, lstm_state
+
+    def get_value(self, x, lstm_state, done, update_obs_rms=False):
+        hidden, _ = self.get_states(x, lstm_state, done, update_obs_rms=update_obs_rms)
+        return self.critic(hidden)
+
+    def _get_probs(self, x, lstm_state, done, update_obs_rms=False):
+        hidden, lstm_state = self.get_states(x, lstm_state, done, update_obs_rms=update_obs_rms)
+
+        cat_logits = self.cat_head(hidden)
+        cont_mean = self.cont_mean(hidden)
+        cont_logstd = self.cont_logstd.expand_as(cont_mean)
+        cont_std = torch.exp(cont_logstd)
+
+        cat_probs = Categorical(logits=cat_logits)
+        cont_probs = Normal(cont_mean, cont_std)
+
+        return hidden, cat_probs, cont_probs, lstm_state
+
+    def get_action_and_value(self, x, lstm_state, done, action=None, update_obs_rms=False):
+        hidden, cat_probs, cont_probs, lstm_state = self._get_probs(x, lstm_state, done, update_obs_rms=update_obs_rms)
+
+        if action is None:
+            # sample discrete
+            cat_action = cat_probs.sample()
+            # sample continuous (reparam not required for PPO, but fine)
+            u = cont_probs.rsample()  # [B,2] pre-squash
+            # squash with affine bounds
+            y = torch.tanh(u)
+            a = self._squash_affine(y)
+            # log-prob: base gaussian - correction
+            base = cont_probs.log_prob(u).sum(dim=-1)
+            corr = self._tanh_correction(u).sum(dim=-1)
+            cont_logprob = base - corr
+        else:
+            cat_action = action['hr_action']
+            # concat provided bounded actions and invert to u-space
+            a = torch.cat([action['price_adjustment'], action['wage_adjustment']], dim=-1)
+            u = self._unsquash_affine(a)  # atanh back to pre-squash
+            base = cont_probs.log_prob(u).sum(dim=-1)
+            corr = self._tanh_correction(u).sum(dim=-1)
+            cont_logprob = base - corr
+
+        logprob = cont_logprob + cat_probs.log_prob(cat_action)
+        entropy = cat_probs.entropy() + cont_probs.entropy().sum(dim=-1)
+        value = self.critic(hidden)  # you reshape later, so keep shape consistent
+
+        # return bounded action dict
+        action_out = {
+            'hr_action': cat_action,
+            'price_adjustment': a[..., 0:1],
+            'wage_adjustment':  a[..., 1:2],
+        }
+        return action_out, logprob, entropy, value, lstm_state
+
+    @torch.no_grad()
+    def predict(self, x, lstm_state, done, deterministic=False):
+        hidden, cat_probs, cont_probs, lstm_state = self._get_probs(x, lstm_state, done)
+
+        if deterministic:
+            cat_action = cat_probs.logits.argmax(dim=-1)
+            u = cont_probs.mean
+        else:
+            cat_action = cat_probs.sample()
+            u = cont_probs.sample()
+
+        y = torch.tanh(u)
+        a = self._squash_affine(y)
+
+        return {
+            'hr_action':        cat_action,
+            'price_adjustment': a[..., 0:1],
+            'wage_adjustment':  a[..., 1:2],
+        }, lstm_state
+
+
+def train(hp: HyperParameters, run_name: str):
+    writer = SummaryWriter(f"runs/{run_name}")
+    writer.add_text(
+        "hyperparameters",
+        "|param|value|\n|-|-|\n%s"
+        % ("\n".join([f"|{key}|{value}|" for key, value in vars(hp).items()])),
+    )
+    device = torch.device('mps' if torch.mps.is_available() else 'cpu')
+    print(f'Training on device {device}')
+    envs = gym.vector.AsyncVectorEnv([make_custom_unbounded_env(survival_bonus=hp.survival_bonus) for _ in range(hp.num_envs)])
+    
+    agent = RecurrentPPOAgent(envs).to(device)
+    optimizer = torch.optim.Adam(agent.parameters(), lr=hp.learning_rate, eps=1e-5)
+
+    # ALGO logic: storage setup
+    obs = torch.zeros((hp.num_steps, hp.num_envs) + envs.single_observation_space.shape).to(device)
+    hr_actions = torch.zeros((hp.num_steps, hp.num_envs) + envs.single_action_space['hr_action'].shape).to(device)
+    price_actions = torch.zeros((hp.num_steps, hp.num_envs) + envs.single_action_space['price_adjustment'].shape).to(device)
+    wage_actions = torch.zeros((hp.num_steps, hp.num_envs) + envs.single_action_space['wage_adjustment'].shape).to(device)
+    log_probs = torch.zeros((hp.num_steps, hp.num_envs)).to(device)
+    rewards = torch.zeros((hp.num_steps, hp.num_envs)).to(device)
+    dones = torch.zeros((hp.num_steps, hp.num_envs)).to(device)
+    values = torch.zeros((hp.num_steps, hp.num_envs)).to(device)
+
+    # LOG returns
+    episode_rewards = []
+    episode_lengths = []
+
+    # TRY NOT TO MODIFY: start the game
+    global_step = 0
+    start_time = time.time()
+    next_obs = torch.Tensor(envs.reset()[0]).to(device)
+    next_done = torch.zeros(hp.num_envs).to(device)
+    next_lstm_state = (
+        torch.zeros(agent.lstm.num_layers, hp.num_envs, agent.lstm.hidden_size).to(device),
+        torch.zeros(agent.lstm.num_layers, hp.num_envs, agent.lstm.hidden_size).to(device),
+    ) # hidden and cell states (see https://youtu.be/8HyCNIVRbSU)
+    num_updates = hp.total_timesteps // hp.batch_size
+
+    for update in range(1, num_updates + 1):
+        initial_lstm_state = (next_lstm_state[0].detach().clone(), next_lstm_state[1].detach().clone())
+        
+        # Annealing the rate if instructed to do so.
+        if hp.anneal_lr:
+            frac = 1.0 - (update - 1.0) / num_updates
+            lr_now = frac * hp.learning_rate
+            optimizer.param_groups[0]["lr"] = lr_now
+
+        for step in range(0, hp.num_steps):
+            global_step += 1 * hp.num_envs
+            obs[step] = next_obs
+            dones[step] = next_done
+
+            # ALGO LOGIC: action logic
+            with torch.no_grad():
+                action, log_prob, _, value, next_lstm_state = agent.get_action_and_value(next_obs, next_lstm_state, next_done, update_obs_rms=True)
+                values[step] = value.flatten()
+
+            hr_actions[step] = action['hr_action']
+            price_actions[step] = action['price_adjustment']
+            wage_actions[step] = action['wage_adjustment']
+            log_probs[step] = log_prob
+
+            # TRY NOT TO MODIFY: execute the game and log data.
+            next_obs, reward, done, _, infos = envs.step({
+                'hr_action': action['hr_action'].cpu().numpy(),
+                'price_adjustment': action['price_adjustment'].cpu().numpy(),
+                'wage_adjustment': action['wage_adjustment'].cpu().numpy()
+            })
+            rewards[step] = torch.tensor(reward.astype(np.float32)).to(device).view(-1)
+            next_obs, next_done = (
+                torch.Tensor(next_obs).to(device),
+                torch.Tensor(done).to(device),
+            )
+
+            if "episode" in infos:
+                for idx, done in enumerate(infos["_episode"]):
+                    if done:
+                        episode_lengths.append(infos["episode"]["l"][idx])
+                        episode_rewards.append(infos['episode']['r'][idx])
+                        recent_avg_length = np.mean(episode_lengths[-20:])
+                        recent_avg = np.mean(episode_rewards[-20:])
+                        print(f"Episode {len(episode_rewards)}: Recent average episodic reward: {recent_avg:.2f}, recent average episodic length: {recent_avg_length:.2f}. Global step: {global_step}")
+                        writer.add_scalar(
+                            "charts/episodic_reward",
+                            infos["episode"]["r"][idx],
+                            global_step,
+                        )
+                        writer.add_scalar(
+                            "charts/episodic_length",
+                            infos["episode"]["l"][idx],
+                            global_step,
+                        )
+        # bootstrap reward if not done
+        with torch.no_grad():
+            next_value = agent.get_value(next_obs, next_lstm_state, next_done).reshape(1, -1)
+            if hp.gae:
+                advantages = torch.zeros_like(rewards).to(device)
+                lastgaelam = 0
+                for t in reversed(range(hp.num_steps)):
+                    if t == hp.num_steps - 1:
+                        nextnonterminal = 1.0 - next_done
+                        nextvalues = next_value
+                    else:
+                        nextnonterminal = 1.0 - dones[t + 1]
+                        nextvalues = values[t + 1]
+                    delta = (
+                        rewards[t]
+                        + hp.gamma * nextvalues * nextnonterminal
+                        - values[t]
+                    )
+                    advantages[t] = lastgaelam = (
+                        delta
+                        + hp.gamma * hp.gae_lambda * nextnonterminal * lastgaelam
+                    )
+                returns = advantages + values
+            else:
+                returns = torch.zeros_like(rewards).to(device)
+                for t in reversed(range(hp.num_steps)):
+                    if t == hp.num_steps - 1:
+                        nextnonterminal = 1.0 - next_done
+                        next_return = next_value
+                    else:
+                        nextnonterminal = 1.0 - dones[t + 1]
+                        next_return = returns[t + 1]
+                    returns[t] = rewards[t] + hp.gamma * nextnonterminal * next_return
+                advantages = returns - values
+                
+        # flatten the batch
+        b_obs = obs.reshape((-1,) + envs.single_observation_space.shape)
+        b_log_probs = log_probs.reshape(-1)
+        b_hr_actions = hr_actions.reshape((-1,) + envs.single_action_space['hr_action'].shape)
+        b_price_actions = price_actions.reshape((-1,) + envs.single_action_space['price_adjustment'].shape)
+        b_wage_actions = wage_actions.reshape((-1,) + envs.single_action_space['wage_adjustment'].shape)
+        b_dones = dones.reshape(-1)
+        b_advantages = advantages.reshape(-1)
+        b_returns = returns.reshape(-1)
+        b_values = values.reshape(-1)
+
+        # optimizing the policy and value network
+        assert hp.num_envs % hp.num_minibatches == 0
+        envsperbatch = hp.num_envs // hp.num_minibatches
+        envinds = np.arange(hp.num_envs)
+        flatinds = np.arange(hp.batch_size).reshape(hp.num_steps, hp.num_envs)
+        clipfracs = []
+        for epoch in range(hp.update_epochs):
+            np.random.shuffle(envinds)
+            for start in range(0, hp.num_envs, envsperbatch):
+                end = start + envsperbatch
+                mbenvinds = envinds[start:end]
+                mb_inds = flatinds[:,mbenvinds].ravel() # be really careful about the index
+
+                _, newlogprob, entropy, new_values, _ = agent.get_action_and_value(
+                    b_obs[mb_inds],
+                    (initial_lstm_state[0][:,mbenvinds], initial_lstm_state[1][:,mbenvinds]),
+                    b_dones[mb_inds],
+                    {
+                        'hr_action': b_hr_actions[mb_inds],
+                        'price_adjustment': b_price_actions[mb_inds],
+                        'wage_adjustment': b_wage_actions[mb_inds]
+                    }
+                )
+                logratio = newlogprob - b_log_probs[mb_inds]
+                ratio = logratio.exp()
+
+                with torch.no_grad():
+                    # calculate approx_kl http://joschu.net/blog/kl-approx.html
+                    old_approx_kl = (-logratio).mean()
+                    approx_kl = ((ratio - 1) - logratio).mean()
+                    clipfracs += [
+                        ((ratio - 1.0).abs() > hp.clip_coef).float().mean().cpu()
+                    ]
+
+                mb_advantages = b_advantages[mb_inds]
+                if hp.norm_adv:
+                    mb_advantages = (mb_advantages - mb_advantages.mean()) / (
+                        mb_advantages.std() + 1e-8
+                    )
+
+                # Policy loss
+                pg_loss1 = -mb_advantages * ratio
+                pg_loss2 = -mb_advantages * torch.clamp(
+                    ratio, 1 - hp.clip_coef, 1 + hp.clip_coef
+                )
+                pg_loss = torch.max(pg_loss1, pg_loss2).mean()
+
+                # Value loss
+                newvalue = new_values.view(-1)
+                if hp.clip_vloss:
+                    v_loss_unclipped = (newvalue - b_returns[mb_inds]) ** 2
+                    v_clipped = b_values[mb_inds] + torch.clamp(
+                        newvalue - b_values[mb_inds], -hp.clip_coef, hp.clip_coef
+                    )
+                    v_loss_clipped = (v_clipped - b_returns[mb_inds]) ** 2
+                    v_loss_max = torch.max(v_loss_unclipped, v_loss_clipped)
+                    v_loss = 0.5 * v_loss_max.mean()
+                else:
+                    v_loss = 0.5 * ((newvalue - b_returns[mb_inds]) ** 2).mean()
+
+                entropy_loss = entropy.mean()
+                loss = pg_loss - hp.ent_coef * entropy_loss + v_loss * hp.vf_coef
+
+                optimizer.zero_grad()
+                loss.backward()
+                nn.utils.clip_grad_norm_(agent.parameters(), hp.max_grad_norm)
+                optimizer.step()
+
+            if hp.target_kl is not None:
+                if approx_kl > hp.target_kl:
+                    break
+
+        y_pred, y_true = b_values.cpu().numpy(), b_returns.cpu().numpy()
+        var_y = np.var(y_true)
+        explained_var = np.nan if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y
+
+        # TRY NOT TO MODIFY: record rewards for plotting purposes
+        writer.add_scalar(
+            "charts/learning_rate", optimizer.param_groups[0]["lr"], global_step
+        )
+        writer.add_scalar("losses/value_loss", v_loss.item(), global_step)
+        writer.add_scalar("losses/policy_loss", pg_loss.item(), global_step)
+        writer.add_scalar("losses/entropy", entropy_loss.item(), global_step)
+        writer.add_scalar("losses/approx_kl", approx_kl.item(), global_step)
+        writer.add_scalar("losses/clipfrac", np.mean(clipfracs), global_step)
+        writer.add_scalar("losses/explained_variance", explained_var, global_step)
+        print("SPS:", int(global_step / (time.time() - start_time)))
+        writer.add_scalar(
+            "charts/SPS", int(global_step / (time.time() - start_time)), global_step
+        )
+
+    envs.close()
+    writer.close()
+    return agent
