@@ -1,26 +1,33 @@
 cff-version: 1.2.0
-message: 'If you use this software, please cite it as below.'
+message: >
+  If you use this software in academic work, please cite the thesis
+  and the archived software release.
+
 title: 'Reinforcement Learning for Firm Behavior in a Macroeconomic Agent-Based Model'
+
 authors:
   - family-names: 'Le'
     given-names: 'Hieu'
     affiliation: 'Aalto University'
     orcid: 'https://orcid.org/0009-0006-2332-6996'
+
 type: software
 doi: '10.5281/zenodo.21674873'
 version: 1.0.0
 date-released: 2026-07-29
 license: MIT
 repository-code: 'https://github.com/Hield/rl-firm-lengnick-abm'
-abstract: >
-  Code, simulation models, trained policy, and reproduction artifacts for
-  investigating reinforcement-learning-controlled firm behavior in the
-  Lengnick macroeconomic agent-based model.
-keywords:
-  - agent-based modeling
-  - reinforcement learning
-  - firm behavior
-  - profit optimization
-  - macroeconomic simulation
-  - computational economics
-  - reproducible research
+
+preferred-citation:
+  type: generic
+  authors:
+    - family-names: 'Le'
+      given-names: 'Hieu'
+  title: >
+    Reinforcement Learning for Firm Behavior in a Macroeconomic Agent-Based Model:
+    Proximal Policy Optimization, Profit Optimization, and Systemic Outcomes
+  thesis-type: "Master's thesis"
+  institution:
+    name: 'Aalto University'
+  year: 2026
+  url: 'https://aaltodoc.aalto.fi/items/cb590e4b-1427-40ea-ac80-7acf4a891887'

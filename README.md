@@ -1,6 +1,13 @@
 # Reinforcement Learning for Firm Behavior in a Macroeconomic Agent-Based Model
 
-This repository contains the code, simulation models, and experiments developed for my thesis on applying reinforcement learning to firm behavior in the Lengnick baseline macroeconomic agent-based model.
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.21674873.svg)](https://doi.org/10.5281/zenodo.21674873)
+
+This repository contains the code, simulation models, trained policy, and
+reproduction notebooks accompanying my Aalto University master's thesis:
+
+**Hieu Le (2026). _Reinforcement Learning for Firm Behavior in a
+Macroeconomic Agent-Based Model: Proximal Policy Optimization, Profit
+Optimization, and Systemic Outcomes._ Aalto University.** [Link](https://aaltodoc.aalto.fi/items/cb590e4b-1427-40ea-ac80-7acf4a891887)
 
 The main notebooks reproduce the results reported in the thesis. The repository also includes selected exploratory experiments involving alternative configurations that were not included in the final thesis.
 
@@ -49,3 +56,19 @@ The notebooks listed above constitute the authoritative reproduction workflow.
 ## License
 
 The source code in this repository is licensed under the MIT License. See [`LICENSE`](LICENSE) for details.
+
+## Citation
+
+If you use this repository or its results, please cite the thesis:
+
+> Le, H. (2026). _Reinforcement Learning for Firm Behavior in a
+> Macroeconomic Agent-Based Model: Proximal Policy Optimization,
+> Profit Optimization, and Systemic Outcomes_. Master's thesis,
+> Aalto University.
+
+For the exact software and reproduction artifacts, please also cite the
+archived software release:
+
+> Le, H. (2026). _Reinforcement Learning for Firm Behavior in a
+> Macroeconomic Agent-Based Model_ (v1.0.0). Zenodo.
+> https://doi.org/10.5281/zenodo.21674873
