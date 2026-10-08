@@ -37,8 +37,7 @@ poetry install
 The notebooks in [`notebooks/`](notebooks/) reproduce the main results presented in the thesis. To launch JupyterLab, run from the root folder:
 
 ```bash
-poetry shell
-jupyter lab
+poetry run jupyter lab
 ```
 
 Run the notebooks in the following order:
